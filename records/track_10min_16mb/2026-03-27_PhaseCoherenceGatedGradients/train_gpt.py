@@ -87,10 +87,10 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     picgd_enabled = bool(int(os.environ.get("PICGD_ENABLED", "1")))
-    picgd_beta = float(os.environ.get("PICGD_BETA", 4.0))
-    picgd_min_gate = float(os.environ.get("PICGD_MIN_GATE", 0.25))
+    picgd_beta = float(os.environ.get("PICGD_BETA", 2.0))
+    picgd_min_gate = float(os.environ.get("PICGD_MIN_GATE", 0.05))
     picgd_eps = float(os.environ.get("PICGD_EPS", 1e-6))
-    picgd_token_stride = int(os.environ.get("PICGD_TOKEN_STRIDE", 16))
+    picgd_token_stride = int(os.environ.get("PICGD_TOKEN_STRIDE", 32))
     sdp_allow_math_fallback = bool(int(os.environ.get("SDP_ALLOW_MATH_FALLBACK", "1")))
 
 # -----------------------------
