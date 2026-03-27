@@ -85,10 +85,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    picgd_enabled = bool(int(os.environ.get("PICGD_ENABLED", "1")))
-    picgd_beta = float(os.environ.get("PICGD_BETA", 4.0))
-    picgd_min_gate = float(os.environ.get("PICGD_MIN_GATE", 0.25))
-    picgd_eps = float(os.environ.get("PICGD_EPS", 1e-6))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -260,8 +256,7 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss, _, _ = model(x, y, return_picgd_stats=False)
-                batch_loss = batch_loss.detach()
+                batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -526,19 +521,6 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
                 param.data = param.data.float()
 
 
-def compute_phase_coherence(latent: Tensor, reference: Tensor, eps: float) -> Tensor:
-    pair_dim = min(latent.size(-1), reference.size(-1)) // 2
-    if pair_dim == 0:
-        return latent.new_zeros(())
-    latent_pairs = latent[..., : pair_dim * 2].float().reshape(*latent.shape[:-1], pair_dim, 2)
-    reference_pairs = reference[..., : pair_dim * 2].float().reshape(*reference.shape[:-1], pair_dim, 2)
-    numerator = (latent_pairs * reference_pairs).sum(dim=-1)
-    latent_norm = latent_pairs.square().sum(dim=-1).sqrt()
-    reference_norm = reference_pairs.square().sum(dim=-1).sqrt()
-    coherence = numerator / (latent_norm * reference_norm).clamp_min(eps)
-    return coherence.mean()
-
-
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -677,23 +659,13 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
-        picgd_enabled: bool,
-        picgd_beta: float,
-        picgd_min_gate: float,
-        picgd_eps: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
-        if not 0.0 < picgd_min_gate <= 1.0:
-            raise ValueError(f"picgd_min_gate must be in (0, 1], got {picgd_min_gate}")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.picgd_enabled = picgd_enabled
-        self.picgd_beta = picgd_beta
-        self.picgd_min_gate = picgd_min_gate
-        self.picgd_eps = picgd_eps
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -725,12 +697,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(
-        self,
-        input_ids: Tensor,
-        target_ids: Tensor,
-        return_picgd_stats: bool = True,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -745,17 +712,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x)
-        if self.picgd_enabled and return_picgd_stats:
-            ref = F.rms_norm(self.tok_emb(target_ids), (x.size(-1),))
-            coherence = compute_phase_coherence(x, ref, self.picgd_eps)
-            gate = self.picgd_min_gate + (1.0 - self.picgd_min_gate) * torch.sigmoid(self.picgd_beta * coherence.detach())
-            coherence = coherence.detach()
-            gate = gate.detach()
-        else:
-            coherence = x.new_zeros(())
-            gate = x.new_ones(())
-        x = x.reshape(-1, x.size(-1))
+        x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -764,8 +721,7 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        return loss, coherence, gate
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
 # -----------------------------
@@ -879,10 +835,6 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-        picgd_enabled=args.picgd_enabled,
-        picgd_beta=args.picgd_beta,
-        picgd_min_gate=args.picgd_min_gate,
-        picgd_eps=args.picgd_eps,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -951,10 +903,6 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
-        f"picgd:enabled={args.picgd_enabled} beta:{args.picgd_beta} "
-        f"min_gate:{args.picgd_min_gate} eps:{args.picgd_eps}"
-    )
-    log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
@@ -992,26 +940,18 @@ def main() -> None:
         model.train()
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
-            warmup_coherence = torch.zeros((), device=device)
-            warmup_gate = torch.zeros((), device=device)
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss, warmup_coherence_step, warmup_gate_step = model(x, y)
-                warmup_coherence += warmup_coherence_step
-                warmup_gate += warmup_gate_step
-                (warmup_loss * warmup_gate_step * grad_scale).backward()
+                    warmup_loss = model(x, y)
+                (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
-                log0(
-                    f"warmup_step:{warmup_step + 1}/{args.warmup_steps} "
-                    f"picgd_coherence:{(warmup_coherence / grad_accum_steps).item():.4f} "
-                    f"picgd_gate:{(warmup_gate / grad_accum_steps).item():.4f}"
-                )
+                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1068,21 +1008,15 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
-        train_coherence = torch.zeros((), device=device)
-        train_gate = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss, coherence, gate = model(x, y)
+                loss = model(x, y)
             train_loss += loss.detach()
-            train_coherence += coherence
-            train_gate += gate
-            (loss * gate * grad_scale).backward()
+            (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
-        train_coherence /= grad_accum_steps
-        train_gate /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1108,7 +1042,6 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"picgd_coherence:{train_coherence.item():.4f} picgd_gate:{train_gate.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
