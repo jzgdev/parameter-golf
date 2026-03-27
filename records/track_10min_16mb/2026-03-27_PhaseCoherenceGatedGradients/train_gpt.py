@@ -620,7 +620,6 @@ class CausalSelfAttention(nn.Module):
             v,
             attn_mask=None,
             is_causal=True,
-            enable_gqa=False,
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
