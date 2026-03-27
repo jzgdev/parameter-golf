@@ -1,9 +1,3 @@
-"""
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
-
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
-"""
-
 from __future__ import annotations
 
 import copy
@@ -26,7 +20,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -101,27 +94,93 @@ class Hyperparameters:
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
+    # Orthogonalize 2D or batched 3D update matrices with a fast Newton-Schulz iteration.
+    # Parallel Muon uses the batched form to process bank shards locally after reduce-scatter.
     a, b, c = (3.4445, -4.7750, 2.0315)
+    was_2d = G.ndim == 2
+    if was_2d:
+        G = G.unsqueeze(0)
     X = G.bfloat16()
-    X /= X.norm() + eps
-    transposed = G.size(0) > G.size(1)
+    transposed = X.size(-2) > X.size(-1)
     if transposed:
-        X = X.T
+        X = X.mT
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
     for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * A @ A
+        A = X @ X.mT
+        B = b * A + c * (A @ A)
         X = a * X + B @ X
-    return X.T if transposed else X
+    if transposed:
+        X = X.mT
+    if was_2d:
+        X = X.squeeze(0)
+    return X
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(
+        self,
+        params,
+        lr: float,
+        momentum: float,
+        backend_steps: int,
+        nesterov: bool = True,
+        weight_decay: float = 0.0,
+    ):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(
+                lr=lr,
+                momentum=momentum,
+                backend_steps=backend_steps,
+                nesterov=nesterov,
+                weight_decay=weight_decay,
+            ),
         )
+        self._built = False
+
+    def _build(self) -> None:
+        self._distributed = dist.is_available() and dist.is_initialized()
+        self._world_size = dist.get_world_size() if self._distributed else 1
+        ws = self._world_size
+        self._bank_meta = []
+        for group in self.param_groups:
+            for p in group["params"]:
+                bank_rows = p.shape[0]
+                padded_rows = ((bank_rows + ws - 1) // ws) * ws
+                shard_rows = padded_rows // ws
+                tail = p.shape[1:]
+                dev = p.device
+                self._bank_meta.append(
+                    {
+                        "p": p,
+                        "B": bank_rows,
+                        "padded_grad": torch.zeros(padded_rows, *tail, device=dev, dtype=torch.bfloat16),
+                        "shard": torch.zeros(shard_rows, *tail, device=dev, dtype=torch.bfloat16),
+                        "shard_mom": torch.zeros(shard_rows, *tail, device=dev, dtype=torch.bfloat16),
+                        "full_update": torch.zeros(padded_rows, *tail, device=dev, dtype=torch.bfloat16),
+                        "scale": max(1, p.shape[-2] / p.shape[-1]) ** 0.5,
+                    }
+                )
+        self._bank_meta.sort(key=lambda meta: -meta["p"].numel())
+        self._built = True
+
+    def launch_reduce_scatters(self) -> None:
+        if not self._built:
+            self._build()
+        if not self._distributed:
+            return
+        self._rs_futures = []
+        for meta in self._bank_meta:
+            p = meta["p"]
+            if p.grad is None:
+                self._rs_futures.append(None)
+                continue
+            padded_grad = meta["padded_grad"]
+            padded_grad[: meta["B"]].copy_(p.grad.bfloat16())
+            if padded_grad.shape[0] > meta["B"]:
+                padded_grad[meta["B"] :].zero_()
+            fut = dist.reduce_scatter_tensor(meta["shard"], padded_grad, op=dist.ReduceOp.AVG, async_op=True)
+            self._rs_futures.append(fut)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -130,47 +189,62 @@ class Muon(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        distributed = dist.is_available() and dist.is_initialized()
-        world_size = dist.get_world_size() if distributed else 1
-        rank = dist.get_rank() if distributed else 0
+        if not self._built:
+            self._build()
 
         for group in self.param_groups:
-            params = group["params"]
-            if not params:
-                continue
             lr = group["lr"]
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            wd = group.get("weight_decay", 0.0)
+            prev_ag_handle = None
+            prev_meta = None
+            sharded = self._distributed and hasattr(self, "_rs_futures")
 
-            total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            for i, meta in enumerate(self._bank_meta):
+                p = meta["p"]
+                if p.grad is None:
+                    continue
 
-            curr = 0
-            for i, p in enumerate(params):
-                if i % world_size == rank and p.grad is not None:
-                    g = p.grad
+                if prev_ag_handle is not None:
+                    prev_ag_handle.wait()
+                    prev_p = prev_meta["p"]
+                    prev_update = prev_meta["full_update"][: prev_meta["B"]]
+                    if wd > 0.0:
+                        prev_p.data.mul_(1.0 - lr * wd)
+                    prev_p.add_(prev_update.to(dtype=prev_p.dtype), alpha=-lr * prev_meta["scale"])
+
+                if sharded and self._rs_futures[i] is not None:
+                    self._rs_futures[i].wait()
+                    g = meta["shard"]
+                    buf = meta["shard_mom"]
+                else:
+                    g = p.grad.bfloat16()
                     state = self.state[p]
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(g)
                     buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if nesterov:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # Scale correction from Muon reference implementations.
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
-                curr += p.numel()
 
-            if distributed:
-                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+                buf.mul_(momentum).add_(g)
+                update = g.add(buf, alpha=momentum) if nesterov else buf
+                update = zeropower_via_newtonschulz5(update, steps=backend_steps)
 
-            curr = 0
-            for p in params:
-                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                p.add_(g, alpha=-lr)
-                curr += p.numel()
+                if sharded:
+                    prev_ag_handle = dist.all_gather_into_tensor(meta["full_update"], update, async_op=True)
+                    prev_meta = meta
+                else:
+                    if wd > 0.0:
+                        p.data.mul_(1.0 - lr * wd)
+                    p.add_(update.to(dtype=p.dtype), alpha=-lr * meta["scale"])
+
+            if prev_ag_handle is not None:
+                prev_ag_handle.wait()
+                prev_p = prev_meta["p"]
+                prev_update = prev_meta["full_update"][: prev_meta["B"]]
+                if wd > 0.0:
+                    prev_p.data.mul_(1.0 - lr * wd)
+                prev_p.add_(prev_update.to(dtype=prev_p.dtype), alpha=-lr * prev_meta["scale"])
 
         return loss
 
@@ -435,6 +509,72 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
+def _unbank_state_dict(state_dict: dict[str, Tensor], num_layers: int) -> dict[str, Tensor]:
+    out: dict[str, Tensor] = {}
+    n = num_layers
+    for name, tensor in state_dict.items():
+        if name == "qo_bank":
+            for i in range(n):
+                out[f"blocks.{i}.attn.c_q.weight"] = tensor[i]
+                out[f"blocks.{i}.attn.proj.weight"] = tensor[n + i]
+        elif name == "kv_bank":
+            for i in range(n):
+                out[f"blocks.{i}.attn.c_k.weight"] = tensor[i]
+                out[f"blocks.{i}.attn.c_v.weight"] = tensor[n + i]
+        elif name == "mlp_up_bank":
+            for i in range(n):
+                out[f"blocks.{i}.mlp.fc.weight"] = tensor[i]
+        elif name == "mlp_down_bank":
+            for i in range(n):
+                out[f"blocks.{i}.mlp.proj.weight"] = tensor[i]
+        else:
+            out[name] = tensor
+    return out
+
+
+def _rebank_state_dict(state_dict: dict[str, Tensor], num_layers: int, template_state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    out: dict[str, Tensor] = {}
+    n = num_layers
+    qo_slices = [None] * (2 * n)
+    kv_slices = [None] * (2 * n)
+    up_slices = [None] * n
+    down_slices = [None] * n
+    consumed = set()
+    for i in range(n):
+        q_key = f"blocks.{i}.attn.c_q.weight"
+        out_key = f"blocks.{i}.attn.proj.weight"
+        k_key = f"blocks.{i}.attn.c_k.weight"
+        v_key = f"blocks.{i}.attn.c_v.weight"
+        up_key = f"blocks.{i}.mlp.fc.weight"
+        down_key = f"blocks.{i}.mlp.proj.weight"
+        if q_key in state_dict:
+            qo_slices[i] = state_dict[q_key]
+            consumed.add(q_key)
+        if out_key in state_dict:
+            qo_slices[n + i] = state_dict[out_key]
+            consumed.add(out_key)
+        if k_key in state_dict:
+            kv_slices[i] = state_dict[k_key]
+            consumed.add(k_key)
+        if v_key in state_dict:
+            kv_slices[n + i] = state_dict[v_key]
+            consumed.add(v_key)
+        if up_key in state_dict:
+            up_slices[i] = state_dict[up_key]
+            consumed.add(up_key)
+        if down_key in state_dict:
+            down_slices[i] = state_dict[down_key]
+            consumed.add(down_key)
+    out["qo_bank"] = torch.stack(qo_slices).to(dtype=template_state_dict["qo_bank"].dtype)
+    out["kv_bank"] = torch.stack(kv_slices).to(dtype=template_state_dict["kv_bank"].dtype)
+    out["mlp_up_bank"] = torch.stack(up_slices).to(dtype=template_state_dict["mlp_up_bank"].dtype)
+    out["mlp_down_bank"] = torch.stack(down_slices).to(dtype=template_state_dict["mlp_down_bank"].dtype)
+    for name, tensor in state_dict.items():
+        if name not in consumed:
+            out[name] = tensor
+    return out
+
+
 # -----------------------------
 # DATA LOADING 
 # -----------------------------
@@ -597,21 +737,15 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
-        kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
         self.use_native_gqa = self.num_kv_heads != self.num_heads and SDPA_SUPPORTS_ENABLE_GQA
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, w_q: Tensor, w_k: Tensor, w_v: Tensor, w_o: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = F.linear(x, w_q.to(dtype=x.dtype)).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = F.linear(x, w_k.to(dtype=x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = F.linear(x, w_v.to(dtype=x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -640,21 +774,18 @@ class CausalSelfAttention(nn.Module):
                 is_causal=True,
             )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        return F.linear(y, w_o.to(dtype=y.dtype))
 
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
-        hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        self.hidden = mlp_mult * dim
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+    def forward(self, x: Tensor, w_up: Tensor, w_down: Tensor) -> Tensor:
+        x = torch.relu(F.linear(x, w_up.to(dtype=x.dtype)))
+        return F.linear(x.square(), w_down.to(dtype=x.dtype))
 
 
 class Block(nn.Module):
@@ -676,12 +807,22 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        x0: Tensor,
+        w_q: Tensor,
+        w_k: Tensor,
+        w_v: Tensor,
+        w_o: Tensor,
+        w_up: Tensor,
+        w_down: Tensor,
+    ) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x), w_q, w_k, w_v, w_o)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x), w_up, w_down)
         return x
 
 
@@ -721,10 +862,18 @@ class GPT(nn.Module):
         self.picgd_eps = picgd_eps
         self.picgd_token_stride = picgd_token_stride
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.num_layers = num_layers
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        head_dim = model_dim // num_heads
+        kv_dim = num_kv_heads * head_dim
+        mlp_dim = mlp_mult * model_dim
+        self.qo_bank = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
+        self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
+        self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
+        self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -747,6 +896,17 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        proj_scale = 1.0 / math.sqrt(2 * self.num_layers)
+        n = self.num_layers
+        for i in range(n):
+            nn.init.orthogonal_(self.qo_bank.data[i], gain=1.0)
+            nn.init.zeros_(self.qo_bank.data[n + i])
+            nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)
+            nn.init.orthogonal_(self.kv_bank.data[n + i], gain=1.0)
+            nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)
+            nn.init.zeros_(self.mlp_down_bank.data[i])
+            self.qo_bank.data[n + i].mul_(proj_scale)
+            self.mlp_down_bank.data[i].mul_(proj_scale)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
@@ -757,6 +917,7 @@ class GPT(nn.Module):
         target_ids: Tensor,
         return_picgd_stats: bool = True,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        n = self.num_layers
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -764,12 +925,31 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](
+                x,
+                x0,
+                self.qo_bank[i],
+                self.kv_bank[i],
+                self.kv_bank[n + i],
+                self.qo_bank[n + i],
+                self.mlp_up_bank[i],
+                self.mlp_down_bank[i],
+            )
             skips.append(x)
         for i in range(self.num_decoder_layers):
+            block_idx = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[block_idx](
+                x,
+                x0,
+                self.qo_bank[block_idx],
+                self.kv_bank[block_idx],
+                self.kv_bank[n + block_idx],
+                self.qo_bank[n + block_idx],
+                self.mlp_up_bank[block_idx],
+                self.mlp_down_bank[block_idx],
+            )
 
         x = self.final_norm(x)
         if self.picgd_enabled and return_picgd_stats:
@@ -915,31 +1095,31 @@ def main() -> None:
         picgd_eps=args.picgd_eps,
         picgd_token_stride=args.picgd_token_stride,
     ).to(device).bfloat16()
+    base_model.qo_bank.data = base_model.qo_bank.data.float()
+    base_model.kv_bank.data = base_model.kv_bank.data.float()
+    base_model.mlp_up_bank.data = base_model.mlp_up_bank.data.float()
+    base_model.mlp_down_bank.data = base_model.mlp_down_bank.data.float()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    model: nn.Module = compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
+    # - 3D parameter banks use MATRIX_LR via Parallel Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
+    matrix_params = [base_model.qo_bank, base_model.kv_bank, base_model.mlp_up_bank, base_model.mlp_down_bank]
+    bank_param_ids = {id(p) for p in matrix_params}
     scalar_params = [
         p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        for _, p in base_model.named_parameters()
+        if id(p) not in bank_param_ids
+        and p is not base_model.tok_emb.weight
+        and (base_model.lm_head is None or p is not base_model.lm_head.weight)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -962,6 +1142,8 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    replicated_params = list(optimizer_tok.param_groups[0]["params"]) + scalar_params
+    optimizer_head = None
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -969,10 +1151,12 @@ def main() -> None:
             eps=args.adam_eps,
             fused=True,
         )
-        optimizers.insert(1, optimizer_head)
+        optimizers.append(optimizer_head)
+        replicated_params.append(base_model.lm_head.weight)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log0("muon_impl:parallel_banked")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(
         f"sdp_backends:cudnn=False flash=True mem_efficient=False "
@@ -1036,14 +1220,16 @@ def main() -> None:
             warmup_coherence = torch.zeros((), device=device)
             warmup_gate = torch.zeros((), device=device)
             for micro_step in range(grad_accum_steps):
-                if distributed:
-                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss, warmup_coherence_step, warmup_gate_step = model(x, y)
                 warmup_coherence += warmup_coherence_step
                 warmup_gate += warmup_gate_step
                 (warmup_loss * warmup_gate_step * grad_scale).backward()
+            if distributed:
+                for p in base_model.parameters():
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
@@ -1056,9 +1242,11 @@ def main() -> None:
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
+            if isinstance(opt, Muon):
+                opt._built = False
+                if hasattr(opt, "_rs_futures"):
+                    delattr(opt, "_rs_futures")
         zero_grad_all()
-        if distributed:
-            model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
@@ -1112,8 +1300,6 @@ def main() -> None:
         train_coherence = torch.zeros((), device=device)
         train_gate = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
-            if distributed:
-                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss, coherence, gate = model(x, y)
@@ -1136,8 +1322,16 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        for opt in optimizers:
-            opt.step()
+        optimizer_muon.launch_reduce_scatters()
+        if distributed:
+            for p in replicated_params:
+                if p.grad is not None:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+        optimizer_tok.step()
+        optimizer_scalar.step()
+        if optimizer_head is not None:
+            optimizer_head.step()
+        optimizer_muon.step()
         zero_grad_all()
 
         step += 1
@@ -1181,7 +1375,8 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    export_state_dict = _unbank_state_dict(base_model.state_dict(), base_model.num_layers)
+    quant_obj, quant_stats = quantize_state_dict_int8(export_state_dict)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1204,7 +1399,12 @@ def main() -> None:
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    roundtrip_state = _rebank_state_dict(
+        dequantize_state_dict_int8(quant_state),
+        base_model.num_layers,
+        base_model.state_dict(),
+    )
+    base_model.load_state_dict(roundtrip_state, strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
