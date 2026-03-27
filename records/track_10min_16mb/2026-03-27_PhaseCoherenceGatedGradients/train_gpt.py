@@ -89,6 +89,7 @@ class Hyperparameters:
     picgd_beta = float(os.environ.get("PICGD_BETA", 4.0))
     picgd_min_gate = float(os.environ.get("PICGD_MIN_GATE", 0.25))
     picgd_eps = float(os.environ.get("PICGD_EPS", 1e-6))
+    sdp_allow_math_fallback = bool(int(os.environ.get("SDP_ALLOW_MATH_FALLBACK", "1")))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -807,10 +808,12 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
+    # Prefer FlashAttention, but keep math enabled so torch.compile / SDPA can
+    # fall back cleanly on GPUs or tracing paths where flash+GQA is unsupported.
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
     enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_math_sdp(args.sdp_allow_math_fallback)
 
     logfile = None
     if master_process:
@@ -943,7 +946,10 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(
+        f"sdp_backends:cudnn=False flash=True mem_efficient=False "
+        f"math={args.sdp_allow_math_fallback}"
+    )
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
