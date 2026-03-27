@@ -1,0 +1,11 @@
+{
+  "name": "Phase Coherence Gated Gradients",
+  "val_bpb": null,
+  "bytes_total": null,
+  "blurb": "Reference scaffold for a PIC-GD adaptation of the baseline train_gpt.py. Unbenchmarked placeholder submission for 2026-03-27.",
+  "author": "",
+  "github_id": "",
+  "date": "2026-03-27",
+  "track": "10min-16mb",
+  "status": "reference-unbenchmarked"
+}
