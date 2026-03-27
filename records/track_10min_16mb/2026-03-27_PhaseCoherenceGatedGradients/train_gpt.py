@@ -63,6 +63,8 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
+    mlp_leaky_slope = float(os.environ.get("MLP_LEAKY_SLOPE", 0.5))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -779,12 +781,13 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, leaky_slope: float):
         super().__init__()
         self.hidden = mlp_mult * dim
+        self.leaky_slope = leaky_slope
 
     def forward(self, x: Tensor, w_up: Tensor, w_down: Tensor) -> Tensor:
-        x = torch.relu(F.linear(x, w_up.to(dtype=x.dtype)))
+        x = F.leaky_relu(F.linear(x, w_up.to(dtype=x.dtype)), negative_slope=self.leaky_slope)
         return F.linear(x.square(), w_down.to(dtype=x.dtype))
 
 
@@ -797,15 +800,19 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        layer_idx: int,
+        ln_scale: bool,
+        mlp_leaky_slope: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, mlp_leaky_slope)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
     def forward(
         self,
@@ -820,9 +827,11 @@ class Block(nn.Module):
     ) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x), w_q, w_k, w_v, w_o)
+        attn_input = self.attn_norm(x) * self.ln_scale_factor
+        attn_out = self.attn(attn_input, w_q, w_k, w_v, w_o)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x), w_up, w_down)
+        mlp_input = self.mlp_norm(x) * self.ln_scale_factor
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_input, w_up, w_down)
         return x
 
 
@@ -845,6 +854,8 @@ class GPT(nn.Module):
         picgd_min_gate: float,
         picgd_eps: float,
         picgd_token_stride: int,
+        ln_scale: bool,
+        mlp_leaky_slope: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -883,6 +894,9 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    layer_idx=i,
+                    ln_scale=ln_scale,
+                    mlp_leaky_slope=mlp_leaky_slope,
                 )
                 for i in range(num_layers)
             ]
@@ -1094,6 +1108,8 @@ def main() -> None:
         picgd_min_gate=args.picgd_min_gate,
         picgd_eps=args.picgd_eps,
         picgd_token_stride=args.picgd_token_stride,
+        ln_scale=args.ln_scale,
+        mlp_leaky_slope=args.mlp_leaky_slope,
     ).to(device).bfloat16()
     base_model.qo_bank.data = base_model.qo_bank.data.float()
     base_model.kv_bank.data = base_model.kv_bank.data.float()
@@ -1155,8 +1171,18 @@ def main() -> None:
         replicated_params.append(base_model.lm_head.weight)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    bank_tensor_count = len(matrix_params)
+    bank_param_count = sum(int(p.numel()) for p in matrix_params)
+    replicated_tensor_count = len(replicated_params)
+    replicated_param_count = sum(int(p.numel()) for p in replicated_params)
     log0(f"model_params:{n_params}")
     log0("muon_impl:parallel_banked")
+    log0(
+        f"optimizer_topology:bank_tensors:{bank_tensor_count} bank_params:{bank_param_count} "
+        f"replicated_tensors:{replicated_tensor_count} replicated_params:{replicated_param_count} "
+        f"manual_replicated_grad_avg:{distributed}"
+    )
+    log0("parallel_muon_overlap:reduce_scatter_then_adam_then_all_gather")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(
         f"sdp_backends:cudnn=False flash=True mem_efficient=False "
@@ -1172,6 +1198,10 @@ def main() -> None:
         f"picgd:enabled={args.picgd_enabled} beta:{args.picgd_beta} "
         f"min_gate:{args.picgd_min_gate} eps:{args.picgd_eps} "
         f"token_stride:{args.picgd_token_stride}"
+    )
+    log0(
+        f"mlp_activation:leaky_relu_squared negative_slope:{args.mlp_leaky_slope} "
+        f"ln_scale:{args.ln_scale}"
     )
     attention_impl = (
         "native_gqa"
@@ -1217,12 +1247,14 @@ def main() -> None:
         model.train()
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
+            warmup_loss_sum = torch.zeros((), device=device)
             warmup_coherence = torch.zeros((), device=device)
             warmup_gate = torch.zeros((), device=device)
             for micro_step in range(grad_accum_steps):
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss, warmup_coherence_step, warmup_gate_step = model(x, y)
+                warmup_loss_sum += warmup_loss.detach()
                 warmup_coherence += warmup_coherence_step
                 warmup_gate += warmup_gate_step
                 (warmup_loss * warmup_gate_step * grad_scale).backward()
@@ -1236,6 +1268,7 @@ def main() -> None:
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(
                     f"warmup_step:{warmup_step + 1}/{args.warmup_steps} "
+                    f"train_loss:{(warmup_loss_sum / grad_accum_steps).item():.4f} "
                     f"picgd_coherence:{(warmup_coherence / grad_accum_steps).item():.4f} "
                     f"picgd_gate:{(warmup_gate / grad_accum_steps).item():.4f}"
                 )
@@ -1278,9 +1311,12 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
             )
+            val_step_avg_ms = training_time_ms / max(step, 1)
+            val_tok_s = args.train_batch_tokens / max(val_step_avg_ms / 1000.0, 1e-9)
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{val_step_avg_ms:.2f}ms "
+                f"tok_s:{val_tok_s:.0f}"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1336,6 +1372,8 @@ def main() -> None:
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        step_avg_ms = approx_training_time_ms / step
+        tok_s = args.train_batch_tokens / max(step_avg_ms / 1000.0, 1e-9)
         should_log_train = (
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
@@ -1344,7 +1382,8 @@ def main() -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"picgd_coherence:{train_coherence.item():.4f} picgd_gate:{train_gate.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"lr_scale:{scale:.4f} muon_momentum:{muon_momentum:.4f} "
+                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{step_avg_ms:.2f}ms tok_s:{tok_s:.0f}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
@@ -1360,6 +1399,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log0("export_mode:unbank_for_quantize rebank_for_roundtrip")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
